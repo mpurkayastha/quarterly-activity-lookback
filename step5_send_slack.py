@@ -36,7 +36,18 @@ def slack_post(message, thread_ts=None):
 
 
 def pct(a, total):
-    return f"{100*a/total:.1f}%" if total else "0%"
+    return f"{100*a/total:.0f}%" if total else "0%"
+
+
+def yoy_growth(t1, t2):
+    if t2 == 0:
+        return "n/a"
+    return f"{(t1-t2)/t2*100:+.0f}%"
+
+
+def pp(a_pct, b_pct):
+    diff = round(a_pct - b_pct)
+    return f"{diff:+d}pp" if diff != 0 else "—"
 
 
 def sum_rows(rlist, period):
@@ -48,18 +59,25 @@ def sum_rows(rlist, period):
 
 
 def build_region_summary(rows, P1, P2):
+    # Exclusive breakdown: D360/AF/Both/Neither are mutually exclusive, sum to 100%
     geo_order = ['AMER', 'EMEA', 'APAC', 'LATAM', 'WW']
-    lines = [f"*AFD360 Org — {P1} vs {P2} | Opp-Linked Activity by Region & Manager*", "",
+    lines = [f"*AFD360 Org — {P1} vs {P2} | Opp+Account-Linked Activity (exclusive breakdown)*",
+             "_D360 / AF / Both / Neither are mutually exclusive — each hour in exactly one bucket_", "",
              "*TOTAL BY REGION (all managers)*", "```",
-             f"{'Region':<8} {'#':>4}  {'D360%':>7} {'AF%':>6} {'Both%':>6} {'Neith%':>7} {P1[:6]:>7}  {'D360%':>7} {'AF%':>6} {P2[:6]:>7}  {'YoY':>6}",
-             "-" * 80]
+             f"{'Region':<8} {'#':>4}  {'D360%':>6} {'AF%':>5} {'Both%':>6} {'Nei%':>5} {P1[:6]:>7}  {'D360%':>6} {'AF%':>5} {'Both%':>6} {'Nei%':>5} {P2[:6]:>7}  {'YoY hrs':>8} {'YoY%':>6}",
+             "-" * 95]
     for geo_val in geo_order:
         geo_rows = [r for r in rows if r.get('Geo') == geo_val]
         if not geo_rows:
             continue
         d1, a1, b1, n1, t1 = sum_rows(geo_rows, P1)
         d2, a2, b2, n2, t2 = sum_rows(geo_rows, P2)
-        lines.append(f"{geo_val:<8} {len(geo_rows):>4}  {pct(d1+b1,t1):>7} {pct(a1+b1,t1):>6} {pct(b1,t1):>6} {pct(n1,t1):>7} {t1:>7.0f}  {pct(d2+b2,t2):>7} {pct(a2+b2,t2):>6} {t2:>7.0f}  {t1-t2:>+6.0f}")
+        lines.append(
+            f"{geo_val:<8} {len(geo_rows):>4}  "
+            f"{pct(d1,t1):>6} {pct(a1,t1):>5} {pct(b1,t1):>6} {pct(n1,t1):>5} {t1:>7.0f}  "
+            f"{pct(d2,t2):>6} {pct(a2,t2):>5} {pct(b2,t2):>6} {pct(n2,t2):>5} {t2:>7.0f}  "
+            f"{t1-t2:>+8.0f} {yoy_growth(t1,t2):>6}"
+        )
     lines.append("```")
     return "\n".join(lines)
 
@@ -69,10 +87,15 @@ def build_manager_msg(rows, mgr, P1, P2):
     mgr_rows = [r for r in rows if r['Region_Manager'] == mgr]
     d1, a1, b1, n1, t1 = sum_rows(mgr_rows, P1)
     d2, a2, b2, n2, t2 = sum_rows(mgr_rows, P2)
-    lines = [f"*{mgr}'s Team — by Region*",
-             f"_Overall: {P1} D360={pct(d1+b1,t1)} AF={pct(a1+b1,t1)} ({t1:.0f}h) | "
-             f"{P2} D360={pct(d2+b2,t2)} AF={pct(a2+b2,t2)} ({t2:.0f}h) | YoY: {t1-t2:+.0f}h_",
-             "```"]
+    lines = [
+        f"*{mgr}'s Team — exclusive breakdown by Region*",
+        f"_Overall {P1}: D360={pct(d1,t1)} AF={pct(a1,t1)} Both={pct(b1,t1)} Nei={pct(n1,t1)} ({t1:.0f}h) | "
+        f"{P2}: D360={pct(d2,t2)} AF={pct(a2,t2)} Both={pct(b2,t2)} Nei={pct(n2,t2)} ({t2:.0f}h) | "
+        f"YoY: {t1-t2:+.0f}h ({yoy_growth(t1,t2)})_",
+        "```",
+        f"{'Geo':<8} {'#':>4}  {'D360%':>6} {'AF%':>5} {'Both%':>6} {'Nei%':>5} {P1[:6]:>7}  {'D360%':>6} {'AF%':>5} {'Both%':>6} {'Nei%':>5} {P2[:6]:>7}  {'YoY hrs':>8} {'YoY%':>6}",
+        "-" * 95,
+    ]
     for geo_val in geo_order:
         geo_rows = [r for r in mgr_rows if r.get('Geo') == geo_val]
         if not geo_rows:
@@ -80,9 +103,12 @@ def build_manager_msg(rows, mgr, P1, P2):
             continue
         dg1, ag1, bg1, ng1, tg1 = sum_rows(geo_rows, P1)
         dg2, ag2, bg2, ng2, tg2 = sum_rows(geo_rows, P2)
-        lines.append(f"{geo_val:<8} {len(geo_rows):>4}  {pct(dg1+bg1,tg1):>7} {pct(ag1+bg1,tg1):>6} "
-                     f"{pct(bg1,tg1):>6} {pct(ng1,tg1):>7} {tg1:>7.0f}  "
-                     f"{pct(dg2+bg2,tg2):>7} {pct(ag2+bg2,tg2):>6} {tg2:>7.0f}  {tg1-tg2:>+6.0f}")
+        lines.append(
+            f"{geo_val:<8} {len(geo_rows):>4}  "
+            f"{pct(dg1,tg1):>6} {pct(ag1,tg1):>5} {pct(bg1,tg1):>6} {pct(ng1,tg1):>5} {tg1:>7.0f}  "
+            f"{pct(dg2,tg2):>6} {pct(ag2,tg2):>5} {pct(bg2,tg2):>6} {pct(ng2,tg2):>5} {tg2:>7.0f}  "
+            f"{tg1-tg2:>+8.0f} {yoy_growth(tg1,tg2):>6}"
+        )
     lines.append("```")
     return "\n".join(lines)
 
