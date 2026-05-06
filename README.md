@@ -58,11 +58,12 @@ python run_all.py
 
 ### Run steps individually
 ```bash
-python step1_fetch_users.py       # pulls org users + geo regions
-python step2_export_activities.py # exports Events, Tasks, OLI SKUs via Bulk API
-python step3_analyze.py           # classifies opps, rolls up hours per person
-python step4_se_activity.py       # queries CRM Analytics for total utilization
-python step5_send_slack.py        # sends all results to Slack
+python step1_fetch_users.py           # pulls org users + geo regions
+python step2_export_activities.py     # exports Events, Tasks, OLI SKUs via Bulk API
+python step2b_fetch_account_assets.py # classifies accounts by purchased/installed products
+python step3_analyze.py               # classifies activities, rolls up hours per person
+python step4_se_activity.py           # queries CRM Analytics for total utilization
+python step5_send_slack.py            # sends all results to Slack
 ```
 
 ### Claude Code skill
@@ -76,10 +77,15 @@ Each opportunity is classified based on its OpportunityLineItem product names/fa
 |---|---|
 | **D360** | Data Cloud, D360, Data 360, DataCloud, CDP, Flex Credit, Einstein Analytics, Data Stream, Identity Resolution, Customer Data Platform |
 | **AF** | Agentforce, SELA, Einstein 1, Agent, A4X, A1E, AELA, Autonomous |
-| **Both** | Opp has SKUs matching both D360 and AF |
+| **Both** | Opp/account has products matching both D360 and AF |
 | **Neither / Other** | Everything else |
 
-Multi-SKU opps use a merge rule: Both wins > D360/AF > Neither.
+Multi-SKU opps and accounts use a merge rule: Both wins > D360/AF > Neither.
+
+Classification priority per activity:
+1. **WhatId = Opportunity (006...)** → classified by OLI SKUs
+2. **WhatId = Account (001...)** → classified by Account's installed/active Asset products
+3. **WhatId = anything else** (Case, DSR, StratInit, Campaign, blank) → Neither
 
 ## Understanding "Other" in SE_Activity
 

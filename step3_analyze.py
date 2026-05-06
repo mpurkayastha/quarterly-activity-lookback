@@ -1,14 +1,20 @@
 """
 Step 3: Classify opps as D360/AF/Both/Neither, roll up hours per person,
-and write the opp-linked per-person activity CSV.
+and write the per-person activity CSV.
+
+Account-linked activities (WhatId starts with 001) are classified using
+the account's purchased/installed Asset products (from step2b), so customer
+success and expansion work is correctly attributed to D360/AF rather than
+landing in Neither.
 
 Output: config.LOOKBACK_CSV
 """
 
-import csv, re, collections
+import csv, re, collections, os
 from config import (USERS_CSV, USERS_GEO_CSV, OLI_CSV, LOOKBACK_CSV,
                     EVENTS_CURRENT_CSV, EVENTS_PRIOR_CSV,
                     TASKS_CURRENT_CSV, TASKS_PRIOR_CSV,
+                    ACCOUNT_CATEGORY_CSV,
                     CURRENT_PERIOD, PRIOR_PERIOD,
                     DEFOE_MANAGER_ID, REGION_LEADS)
 
@@ -39,6 +45,22 @@ def build_opp_category():
         opp_category[oid] = MERGE.get(frozenset([prev, cat]), 'Both')
     print(f"Classified {len(opp_category)} unique opps")
     return opp_category
+
+
+def build_account_category():
+    """Load account → D360/AF/Both/Neither classification from asset data."""
+    if not os.path.exists(ACCOUNT_CATEGORY_CSV):
+        print("  Warning: account_category.csv not found — run step2b first. Account-linked activities will be Neither.")
+        return {}
+    account_category = {}
+    for row in csv.DictReader(open(ACCOUNT_CATEGORY_CSV)):
+        account_category[row['AccountId']] = row['Category']
+    d360 = sum(1 for v in account_category.values() if v == 'D360')
+    af   = sum(1 for v in account_category.values() if v == 'AF')
+    both = sum(1 for v in account_category.values() if v == 'Both')
+    neither = sum(1 for v in account_category.values() if v == 'Neither')
+    print(f"Account categories: D360={d360}, AF={af}, Both={both}, Neither={neither}")
+    return account_category
 
 
 def build_user_map():
@@ -72,7 +94,21 @@ def get_region(user_id, users):
     return 'Unknown'
 
 
-def accumulate_hours(opp_category):
+def classify_whatid(wid, opp_category, account_category):
+    """
+    Classify an activity by its WhatId:
+      - 006... → opp-linked: use OLI-based opp_category
+      - 001... → account-linked: use asset-based account_category
+      - anything else → Neither (Case, DSR, StratInit, Campaign, blank)
+    """
+    if wid.startswith('006'):
+        return opp_category.get(wid, 'Neither')
+    if wid.startswith('001'):
+        return account_category.get(wid, 'Neither')
+    return 'Neither'
+
+
+def accumulate_hours(opp_category, account_category):
     hours = collections.defaultdict(lambda: collections.defaultdict(float))
 
     def process_events(fname, period):
@@ -80,7 +116,7 @@ def accumulate_hours(opp_category):
             uid = row['OwnerId']
             wid = row.get('WhatId', '')
             hrs = float(row.get('DurationInMinutes') or 0) / 60.0
-            cat = opp_category.get(wid, 'Neither') if wid.startswith('006') else 'Neither'
+            cat = classify_whatid(wid, opp_category, account_category)
             hours[uid][f'{period}_{cat}'] += hrs
 
     def process_tasks(fname, period):
@@ -88,7 +124,7 @@ def accumulate_hours(opp_category):
             uid = row['OwnerId']
             wid = row.get('WhatId', '')
             hrs = float(row.get('Duration__c') or 0)
-            cat = opp_category.get(wid, 'Neither') if wid.startswith('006') else 'Neither'
+            cat = classify_whatid(wid, opp_category, account_category)
             hours[uid][f'{period}_{cat}'] += hrs
 
     process_events(EVENTS_CURRENT_CSV, CURRENT_PERIOD)
@@ -137,8 +173,9 @@ def write_csv(users, geo_map, hours):
 
 
 if __name__ == "__main__":
-    opp_category = build_opp_category()
-    users = build_user_map()
-    geo_map = build_geo_map()
-    hours = accumulate_hours(opp_category)
+    opp_category     = build_opp_category()
+    account_category = build_account_category()
+    users            = build_user_map()
+    geo_map          = build_geo_map()
+    hours            = accumulate_hours(opp_category, account_category)
     write_csv(users, geo_map, hours)

@@ -12,13 +12,14 @@ Runs the full FY Q1 activity analysis for John DeFoe's AFD360 org, comparing Age
 2. Fetches `sfbase__Region__c` (AMER/EMEA/APAC/LACA/JP/WW) for each user to enable geographic breakdowns.
 3. Exports Events and Tasks for both the current and prior-year Q1 periods using Bulk API 2.0.
 4. Pulls OpportunityLineItem SKUs for all opportunity IDs found in those activities.
-5. Classifies each opportunity as D360, AF, Both, or Neither using product name/family/code regex.
-6. Rolls up hours per person (Events = DurationInMinutes/60, Tasks = Duration__c already in hours).
-7. Maps each person to their org region via DeFoe's direct reports (Aiysha Mubarik, Salman Mian, Teddy Griffin, Anil Dindigal).
-8. Outputs a per-person CSV: `Region_Manager, Manager, Name, Title, Geo, [FY_current]_D360/AF/Both/Neither/Total, [FY_prior]_D360/AF/Both/Neither/Total, YoY_total`.
-9. Queries SE_Activity CRM Analytics dataset for total utilization hours (all activities, not just opp-linked), broken down by D360/AF/Both/Other per person and region.
-10. Produces an "Other" drill-down showing what the non-D360/AF hours consist of (internal meetings, non-D360/AF opps, account-only, no WhatId, etc.).
-11. Sends to Slackbot DM:
+5. **Fetches Account Asset records** for all accounts linked to activities — classifies each account as D360/AF/Both/Neither based on their purchased/installed products. This ensures account-linked meetings (customer success, expansion work on existing customers) are attributed to D360/AF rather than landing in Neither.
+6. Classifies each activity using: Opp → OLI SKUs; Account → Asset products; all other WhatId types → Neither.
+7. Rolls up hours per person (Events = DurationInMinutes/60, Tasks = Duration__c already in hours).
+8. Maps each person to their org region via DeFoe's direct reports (Aiysha Mubarik, Salman Mian, Teddy Griffin, Anil Dindigal).
+9. Outputs a per-person CSV: `Region_Manager, Manager, Name, Title, Geo, [FY_current]_D360/AF/Both/Neither/Total, [FY_prior]_D360/AF/Both/Neither/Total, YoY_total`.
+10. Queries SE_Activity CRM Analytics dataset for total utilization hours (all activities, not just opp-linked), broken down by D360/AF/Both/Other per person and region.
+11. Produces an "Other" drill-down showing what the non-D360/AF hours consist of (internal meetings, non-D360/AF opps, account-only, no WhatId, etc.).
+12. Sends to Slackbot DM:
     - **Summary**: org-wide + top-line per manager
     - **Region table**: AMER/EMEA/APAC/LATAM/WW totals across all managers
     - **Per-manager × region breakdown**: one table per manager (Aiysha, Salman, Teddy, Anil)
@@ -187,6 +188,78 @@ def download_bulk_job(job_id, token, instance_url, output_file):
 
 ---
 
+## Step 3c — Fetch Account Asset data (classify account-linked meetings)
+
+After exporting Events/Tasks, collect all Account IDs (WhatId starting with `001`) and query their `Asset` records to classify each account as D360/AF/Both/Neither based on purchased/installed products. This means meetings logged against an account — customer success, expansion calls, QBRs on existing customers — are attributed to the right product line rather than falling into Neither.
+
+```python
+import csv, subprocess, json, re
+
+D360_PAT = re.compile(r'data.?cloud|d360|data 360|data360|datacloud|flex credit|einstein analytics|data stream|identity resolution|cdp|customer data platform', re.I)
+AF_PAT   = re.compile(r'agentforce|sela|einstein 1|agent|a4x|a1e|aela|autonomous', re.I)
+ACTIVE_STATUSES = {'Installed', 'Active', 'Purchased', 'In Use'}
+
+MERGE = {
+    frozenset(['D360','AF']):'Both', frozenset(['Both','D360']):'Both',
+    frozenset(['Both','AF']):'Both', frozenset(['Both','Neither']):'Both',
+    frozenset(['D360','Neither']):'D360', frozenset(['AF','Neither']):'AF',
+    frozenset(['Neither','Neither']):'Neither', frozenset(['D360','D360']):'D360',
+    frozenset(['AF','AF']):'AF', frozenset(['Both','Both']):'Both',
+}
+
+# Collect account IDs from all four activity files
+account_ids = set()
+for fname in ['/tmp/events_fy27q1_bulk.csv', '/tmp/events_fy26q1_bulk.csv',
+              '/tmp/tasks_fy27q1_bulk.csv', '/tmp/tasks_fy26q1_bulk.csv']:
+    for row in csv.DictReader(open(fname)):
+        wid = row.get('WhatId', '')
+        if wid.startswith('001'):
+            account_ids.add(wid)
+print(f"Unique account IDs: {len(account_ids)}")
+
+# Query Asset records in batches of 200
+all_assets = []
+for batch in [list(account_ids)[i:i+200] for i in range(0, len(account_ids), 200)]:
+    id_str = "','".join(batch)
+    result = subprocess.run(
+        ['sf', 'data', 'query', '--target-org', 'mpurkayastha@salesforce.com',
+         '--query', f"SELECT AccountId, Product2.Name, Product2.Family, Product2.ProductCode, Status FROM Asset WHERE AccountId IN ('{id_str}')",
+         '--result-format', 'json'],
+        capture_output=True, text=True
+    )
+    records = json.loads(result.stdout).get('result', {}).get('records', [])
+    for r in records:
+        all_assets.append({
+            'AccountId':            r.get('AccountId', ''),
+            'Product2.Name':        r.get('Product2', {}).get('Name', '') if r.get('Product2') else '',
+            'Product2.Family':      r.get('Product2', {}).get('Family', '') if r.get('Product2') else '',
+            'Product2.ProductCode': r.get('Product2', {}).get('ProductCode', '') if r.get('Product2') else '',
+            'Status':               r.get('Status', ''),
+        })
+
+# Classify each account
+account_category = {}
+for row in all_assets:
+    if row.get('Status') and row['Status'] not in ACTIVE_STATUSES:
+        continue
+    aid = row['AccountId']
+    if not aid: continue
+    text = f"{row['Product2.Name']} {row['Product2.Family']} {row['Product2.ProductCode']}"
+    is_d360, is_af = bool(D360_PAT.search(text)), bool(AF_PAT.search(text))
+    cat = 'Both' if (is_d360 and is_af) else ('D360' if is_d360 else ('AF' if is_af else 'Neither'))
+    prev = account_category.get(aid, 'Neither')
+    account_category[aid] = MERGE.get(frozenset([prev, cat]), 'Both')
+
+with open('/tmp/account_category.csv', 'w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['AccountId','Category'])
+    w.writeheader()
+    for aid, cat in account_category.items():
+        w.writerow({'AccountId': aid, 'Category': cat})
+print(f"Wrote {len(account_category)} account categories → /tmp/account_category.csv")
+```
+
+---
+
 ## Step 4 — Export Tasks via Bulk API 2.0
 
 The correct hours field on Task is **`Duration__c`** (labeled "Time(Hrs)", type double). Do NOT use `Hours__c` or `Hour__c`.
@@ -258,7 +331,7 @@ def classify_sku(name, family, code):
     if is_af:   return 'AF'
     return 'Neither'
 
-# Build opp → category map
+# Build opp → category map (from OLI SKUs)
 opp_category = {}
 for row in csv.DictReader(open('/tmp/oli_skus.csv')):
     oid = row['OpportunityId']
@@ -270,6 +343,10 @@ for row in csv.DictReader(open('/tmp/oli_skus.csv')):
              frozenset(['Neither','Neither']):'Neither', frozenset(['D360','D360']):'D360',
              frozenset(['AF','AF']):'AF', frozenset(['Both','Both']):'Both'}
     opp_category[oid] = merge.get(frozenset([prev, cat]), 'Both')
+
+# Build account → category map (from Asset records, Step 3c)
+account_category = {r['AccountId']: r['Category']
+                    for r in csv.DictReader(open('/tmp/account_category.csv'))}
 
 # Build user map
 users = {r['Id']: r for r in csv.DictReader(open('/tmp/defoe_users.csv'))}
@@ -297,21 +374,27 @@ def get_region(user_id):
 
 Hours = collections.defaultdict(lambda: collections.defaultdict(float))
 
+def classify_whatid(wid):
+    """Opp → OLI SKUs; Account → Asset products; everything else → Neither."""
+    if wid.startswith('006'):
+        return opp_category.get(wid, 'Neither')
+    if wid.startswith('001'):
+        return account_category.get(wid, 'Neither')
+    return 'Neither'
+
 def process_events(fname, period):
     for row in csv.DictReader(open(fname)):
         uid = row['OwnerId']
         wid = row.get('WhatId', '')
         hrs = float(row.get('DurationInMinutes') or 0) / 60.0
-        cat = opp_category.get(wid, 'Neither') if wid.startswith('006') else 'Neither'
-        Hours[uid][f'{period}_{cat}'] += hrs
+        Hours[uid][f'{period}_{classify_whatid(wid)}'] += hrs
 
 def process_tasks(fname, period):
     for row in csv.DictReader(open(fname)):
         uid = row['OwnerId']
         wid = row.get('WhatId', '')
         hrs = float(row.get('Duration__c') or 0)
-        cat = opp_category.get(wid, 'Neither') if wid.startswith('006') else 'Neither'
-        Hours[uid][f'{period}_{cat}'] += hrs
+        Hours[uid][f'{period}_{classify_whatid(wid)}'] += hrs
 
 process_events('/tmp/events_fy27q1_bulk.csv', 'FY27Q1')
 process_events('/tmp/events_fy26q1_bulk.csv', 'FY26Q1')
@@ -748,7 +831,8 @@ lines = ["*AFD360 Org — SE_Activity 'Other' Breakdown | FY27Q1 vs FY26Q1*", ""
 - **Task hours field**: Always use `Duration__c` — verified via `sf sobject describe --sobject Task`.
 - **The `Both` category** means the opp has SKUs matching both D360 and AF patterns.
 - **SE_Activity vs opp-linked hours**: SE_Activity captures ALL activities (41,723h FY27Q1); opp-linked analysis captures only WhatId=Opp rows (~11,738h). Use SE_Activity for total utilization, opp-linked for deal coverage depth.
-- **"Other" in SE_Activity** breaks down as: ~36% internal meetings, ~27% customer meetings on non-D360/AF opps, ~25% customer meetings not linked to any opp (Account-only or no WhatId), ~10% blank/unclassified. The Account-only and no-WhatId buckets represent real customer time that isn't captured in deal metrics.
+- **Account-linked activity classification**: Activities with WhatId=Account (001...) are classified using the account's `Asset` records — only `Installed`, `Active`, `Purchased`, or `In Use` statuses count. This captures customer success, expansion calls, and QBRs on existing D360/AF customers that don't have an open opp.
+- **"Other" in SE_Activity** breaks down as: ~36% internal meetings, ~27% customer meetings on non-D360/AF opps, ~25% customer meetings not linked to any opp (Account-only or no WhatId), ~10% blank/unclassified. After adding account asset classification, the Account-only bucket should shrink as more of that time is correctly attributed to D360/AF.
 - **FY26Q1 Other sub-buckets**: WhatObjectId is not populated for older SE_Activity records, so Account/no-WhatId/Case/etc. show as zero for FY26Q1 — all non-opp customer time rolls into "opp not tagged D360/AF" for prior year.
 - **Anil LATAM anomaly (FY27Q1)**: D360=0.4%/AF=0% despite +147% volume growth vs FY26Q1 — worth investigating whether deal coverage is being logged to correct opps.
 - **Slack chunking**: SE_Activity CSV (179 rows) splits into ~5 chunks of ≤4300 chars each. Send as thread replies to avoid channel noise.
