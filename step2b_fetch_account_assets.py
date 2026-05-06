@@ -1,10 +1,13 @@
 """
 Step 2b: For all accounts linked to activities (WhatId starting with 001),
-query their Asset records to classify accounts as D360/AF/Both/Neither
-based on purchased/installed products.
+query their OrderItem records to classify accounts as D360/AF/Both/Neither
+based on purchased products.
 
 This enables account-linked meetings (customer success / expansion work)
 to be classified as D360/AF rather than landing in Other/Neither.
+
+Note: Uses OrderItem (via Order.AccountId) rather than the Asset sObject,
+which may not be available in all orgs.
 
 Output: config.ACCOUNT_ASSETS_CSV  (AccountId, Product2.Name, Product2.Family, Product2.ProductCode)
         config.ACCOUNT_CATEGORY_CSV (AccountId, Category)
@@ -30,9 +33,6 @@ MERGE = {
     frozenset(['AF', 'AF']): 'AF',        frozenset(['Both', 'Both']): 'Both',
 }
 
-# Asset statuses that indicate the product is active/purchased
-ACTIVE_STATUSES = {'Installed', 'Active', 'Purchased', 'In Use'}
-
 
 def collect_account_ids():
     account_ids = set()
@@ -47,35 +47,41 @@ def collect_account_ids():
     return account_ids
 
 
-def fetch_assets(account_ids):
-    print(f"Fetching assets for {len(account_ids)} accounts...")
+def fetch_order_items(account_ids):
+    """Query OrderItem for all accounts to get purchased products."""
+    print(f"Fetching OrderItem products for {len(account_ids)} accounts...")
     all_rows = []
     id_list = list(account_ids)
-    batches = [id_list[i:i+200] for i in range(0, len(id_list), 200)]
+    batches = [id_list[i:i+100] for i in range(0, len(id_list), 100)]
 
     for i, batch in enumerate(batches):
         id_str = "','".join(batch)
-        query = (f"SELECT AccountId, Product2.Name, Product2.Family, Product2.ProductCode, Status "
-                 f"FROM Asset "
-                 f"WHERE AccountId IN ('{id_str}')")
+        query = (f"SELECT Order.AccountId, Product2.Name, Product2.Family, Product2.ProductCode "
+                 f"FROM OrderItem "
+                 f"WHERE Order.AccountId IN ('{id_str}')")
         result = subprocess.run(
             ['sf', 'data', 'query', '--target-org', TARGET_ORG,
              '--query', query, '--result-format', 'json'],
             capture_output=True, text=True
         )
-        records = json.loads(result.stdout).get('result', {}).get('records', [])
+        try:
+            records = json.loads(result.stdout).get('result', {}).get('records', [])
+        except (json.JSONDecodeError, AttributeError):
+            records = []
         for r in records:
+            order = r.get('Order') or {}
+            p2    = r.get('Product2') or {}
             all_rows.append({
-                'AccountId':           r.get('AccountId', ''),
-                'Product2.Name':       r.get('Product2', {}).get('Name', '') if r.get('Product2') else '',
-                'Product2.Family':     r.get('Product2', {}).get('Family', '') if r.get('Product2') else '',
-                'Product2.ProductCode':r.get('Product2', {}).get('ProductCode', '') if r.get('Product2') else '',
-                'Status':              r.get('Status', ''),
+                'AccountId':            order.get('AccountId', ''),
+                'Product2.Name':        p2.get('Name', ''),
+                'Product2.Family':      p2.get('Family', ''),
+                'Product2.ProductCode': p2.get('ProductCode', ''),
             })
-        print(f"  Batch {i+1}/{len(batches)}: {len(records)} assets")
+        if (i + 1) % 10 == 0 or (i + 1) == len(batches):
+            print(f"  Batch {i+1}/{len(batches)} done ({len(all_rows)} rows so far)")
 
     with open(ACCOUNT_ASSETS_CSV, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['AccountId','Product2.Name','Product2.Family','Product2.ProductCode','Status'])
+        w = csv.DictWriter(f, fieldnames=['AccountId', 'Product2.Name', 'Product2.Family', 'Product2.ProductCode'])
         w.writeheader()
         w.writerows(all_rows)
     print(f"  → {ACCOUNT_ASSETS_CSV} ({len(all_rows)} rows)")
@@ -83,13 +89,10 @@ def fetch_assets(account_ids):
 
 
 def build_account_category(asset_rows):
-    """Classify each account based on its installed/active product assets."""
+    """Classify each account based on its purchased OrderItem products."""
     account_category = {}
     for row in asset_rows:
-        # Only count active/installed assets
-        if row.get('Status') and row['Status'] not in ACTIVE_STATUSES:
-            continue
-        aid = row['AccountId']
+        aid = row.get('AccountId', '')
         if not aid:
             continue
         text = f"{row.get('Product2.Name','')} {row.get('Product2.Family','')} {row.get('Product2.ProductCode','')}"
@@ -117,9 +120,9 @@ if __name__ == "__main__":
     account_ids = collect_account_ids()
     print(f"Found {len(account_ids)} unique account IDs in activity exports")
     if account_ids:
-        asset_rows = fetch_assets(account_ids)
+        asset_rows = fetch_order_items(account_ids)
         build_account_category(asset_rows)
     else:
         print("No account-linked activities found — writing empty files.")
-        open(ACCOUNT_ASSETS_CSV, 'w').write("AccountId,Product2.Name,Product2.Family,Product2.ProductCode,Status\n")
+        open(ACCOUNT_ASSETS_CSV, 'w').write("AccountId,Product2.Name,Product2.Family,Product2.ProductCode\n")
         open(ACCOUNT_CATEGORY_CSV, 'w').write("AccountId,Category\n")
